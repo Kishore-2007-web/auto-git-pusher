@@ -1,7 +1,7 @@
 """
 agent.py - Main entry point and orchestrator for Daily GitHub Agent V1.
 
-Workflow-
+Workflow:
 1. Loads configuration & task specifications (supports single task or task queues)
 2. Selects the next batch of pending tasks (e.g. 2 per run based on settings.json)
 3. For each task in batch:
