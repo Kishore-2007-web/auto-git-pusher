@@ -1,0 +1,16 @@
+{
+  "workspace_directory": "workspace",
+  "dry_run": false,
+  "tasks_per_run": 2,
+  "loop_tasks": true,
+  "require_clean_git_before_start": true,
+  "allowed_extensions": [
+    ".md",
+    ".txt",
+    ".py",
+    ".js",
+    ".html",
+    ".css"
+  ],
+  "max_changed_files": 1
+}

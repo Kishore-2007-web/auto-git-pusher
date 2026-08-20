@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Agent logs (keep .gitkeep)
+logs/*
+!logs/.gitkeep
+
+# Target workspace repositories (keep .gitkeep)
+workspace/*
+!workspace/.gitkeep
+
+# Temporary backups
+*.bak
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
