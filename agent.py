@@ -188,6 +188,8 @@ def run_agent(
 
             backup_file: Optional[Path] = None
             target_file: Optional[Path] = None
+            project_dir: Optional[Path] = None
+            commit_created: bool = False
 
             try:
                 # Path and Security Validation
@@ -204,6 +206,16 @@ def run_agent(
                 is_git, git_msg = git_manager.check_git_repository(project_dir)
                 if not is_git:
                     raise git_manager.GitError(f"Directory is not a valid Git repository: {git_msg}")
+
+                # Auto Sync with Remote Repository (git pull) if clean
+                is_clean, dirty_files = git_manager.is_git_clean(project_dir)
+                if is_clean and not dry_run:
+                    print("[*] Syncing with remote repository (git pull)...")
+                    pull_ok, pull_msg = git_manager.git_pull(project_dir)
+                    if pull_ok:
+                        print(" [OK] Git pull synced successfully.")
+                    else:
+                        logger.warning(f"Auto-pull before task warning: {pull_msg}")
 
                 # Check Clean Git Status
                 if require_clean:
@@ -266,6 +278,7 @@ def run_agent(
 
                     print(f"[*] Committing: '{task.commit_message}'...")
                     commit_hash = git_manager.git_commit(project_dir, task.commit_message)
+                    commit_created = True
                     logger.info(f"Task #{task.id} committed: {commit_hash}")
 
                     print("[*] Pushing to remote repository...")
@@ -284,6 +297,8 @@ def run_agent(
             except (validator.ValidationError, task_manager.TaskError, git_manager.GitError) as e:
                 print(f"\n[ERROR on Task #{task.id}] {e}")
                 logger.error(f"Task #{task.id} failed: {e}")
+                if commit_created and project_dir:
+                    git_manager.undo_last_commit(project_dir)
                 if target_file and backup_file:
                     validator.restore_backup(target_file, backup_file)
                     validator.cleanup_backup(backup_file)

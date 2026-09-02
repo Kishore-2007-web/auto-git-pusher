@@ -185,3 +185,29 @@ def git_push(repo_path: Path, remote: str = "origin", branch: Optional[str] = No
     proc = _run_git_command(["push", remote, target_branch], cwd=repo_path, check=True)
     out = proc.stdout.strip() or proc.stderr.strip() or f"Pushed successfully to {remote}/{target_branch}"
     return out
+
+
+def git_pull(repo_path: Path, remote: str = "origin", branch: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Pull latest changes from remote repository safely before execution.
+    """
+    target_branch = branch or get_current_branch(repo_path)
+    logger.info(f"Pulling latest from remote '{remote}' branch '{target_branch}'...")
+
+    proc = _run_git_command(["pull", remote, target_branch], cwd=repo_path, check=False)
+    if proc.returncode == 0:
+        out = proc.stdout.strip() or f"Pulled successfully from {remote}/{target_branch}"
+        return True, out
+    else:
+        err = proc.stderr.strip() or proc.stdout.strip() or "git pull failed"
+        logger.warning(f"Git pull warning: {err}")
+        return False, err
+
+
+def undo_last_commit(repo_path: Path) -> None:
+    """
+    Undo the last local commit (reset HEAD~1) safely if subsequent steps (like push) fail.
+    """
+    logger.info("Undoing last local commit to maintain clean repository state...")
+    _run_git_command(["reset", "HEAD~1"], cwd=repo_path, check=False)
+
