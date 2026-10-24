@@ -25,6 +25,8 @@ class ValidationError(Exception):
 FORBIDDEN_PATTERNS = [
     ".env",
     ".git",
+    ".github",
+    "workflow",
     "credential",
     "id_rsa",
     "id_ed25519",
@@ -58,8 +60,10 @@ def is_forbidden_target(target_path: Path) -> Tuple[bool, str]:
 
     # Check parts and filename
     for part in path_parts_lower:
-        if part == ".git" or part.startswith(".git"):
+        if part == ".git":
             return True, f"Modifying .git directory or files is strictly forbidden: '{part}'"
+        if part == ".github" or "workflow" in part:
+            return True, f"Modifying .github workflow directory is strictly forbidden: '{part}'"
 
     for pattern in FORBIDDEN_PATTERNS:
         if pattern in filename_lower:
@@ -100,6 +104,58 @@ def validate_settings(settings: Dict[str, Any]) -> None:
         if not isinstance(settings["loop_tasks"], bool):
             raise ValidationError("settings.json 'loop_tasks' must be a boolean (true or false).")
 
+    if "allowed_repositories" in settings:
+        if not isinstance(settings["allowed_repositories"], list):
+            raise ValidationError("settings.json 'allowed_repositories' must be a list of strings if specified.")
+
+    if "allowed_branches" in settings:
+        if not isinstance(settings["allowed_branches"], list):
+            raise ValidationError("settings.json 'allowed_branches' must be a list of strings if specified.")
+
+    if "emergency_pause" in settings:
+        if not isinstance(settings["emergency_pause"], bool):
+            raise ValidationError("settings.json 'emergency_pause' must be a boolean if specified.")
+
+
+def check_emergency_pause(settings: Dict[str, Any]) -> bool:
+    """
+    Check if automation is paused via settings.json or environment variable AUTOMATION_PAUSED.
+    """
+    if settings.get("emergency_pause", False):
+        return True
+    env_paused = os.getenv("AUTOMATION_PAUSED", "").strip().lower()
+    return env_paused in ("true", "1", "yes")
+
+
+def validate_repository_and_branch(
+    project_name: str,
+    branch_name: str,
+    allowed_repositories: Optional[List[str]] = None,
+    allowed_branches: Optional[List[str]] = None,
+) -> None:
+    """
+    Enforce explicit allowlists on repository project names and active Git branches.
+    """
+    if allowed_repositories:
+        normalized_allowed_repos = [r.strip().lower() for r in allowed_repositories if r.strip()]
+        proj_norm = project_name.strip().lower()
+        # Allow match either by simple name ("weather") or full name ("Kishore-2007-web/weather")
+        repo_matched = any(
+            proj_norm == allowed or proj_norm.endswith(f"/{allowed}") or allowed.endswith(f"/{proj_norm}")
+            for allowed in normalized_allowed_repos
+        )
+        if not repo_matched:
+            raise ValidationError(
+                f"Project '{project_name}' is not in approved allowed_repositories: {allowed_repositories}"
+            )
+
+    if allowed_branches:
+        normalized_allowed_branches = [b.strip() for b in allowed_branches if b.strip()]
+        if branch_name not in normalized_allowed_branches:
+            raise ValidationError(
+                f"Branch '{branch_name}' is not in approved allowed_branches: {allowed_branches}"
+            )
+
 
 def validate_paths(
     base_dir: Path,
@@ -109,7 +165,7 @@ def validate_paths(
     allowed_extensions: List[str],
 ) -> Tuple[Path, Path]:
     """
-    Strictly validate project and file paths against directory traversal and boundaries.
+    Strictly validate project and file paths against directory traversal, symlinks, and boundaries.
 
     Returns:
         Tuple[Path, Path]: (resolved_project_dir, resolved_target_file)
@@ -137,6 +193,10 @@ def validate_paths(
 
     project_dir = (workspace_dir / project_name).resolve()
 
+    # Reject symlinks to prevent symlink traversal escapes
+    if project_dir.is_symlink():
+        raise ValidationError(f"Project directory '{project_dir}' is a symlink. Symlinks are forbidden.")
+
     # Ensure project_dir is strictly inside workspace_dir
     try:
         project_dir.relative_to(workspace_dir)
@@ -150,6 +210,10 @@ def validate_paths(
         raise ValidationError(f"Target project directory not found: '{project_dir}'")
 
     target_file = (project_dir / file_rel_path).resolve()
+
+    # Reject symlinks on target file
+    if target_file.is_symlink():
+        raise ValidationError(f"Target file '{target_file}' is a symlink. Symlinks are forbidden.")
 
     # Ensure target_file is strictly inside project_dir
     try:

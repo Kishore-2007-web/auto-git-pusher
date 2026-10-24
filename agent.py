@@ -19,16 +19,22 @@ import argparse
 import datetime
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import confirmation_gui
 import git_manager
+import notifier
 import task_manager
 import validator
 
 logger = logging.getLogger("daily_github_agent")
+
+# Structured Exit Codes
+EXIT_SUCCESS: int = 0
+EXIT_ERROR: int = 1
 
 
 def print_banner() -> None:
@@ -89,6 +95,7 @@ def run_agent(
     config_dir: Path,
     debug: bool = False,
     use_gui: bool = False,
+    dry_run_override: Optional[bool] = None,
 ) -> int:
     """
     Main execution workflow for Daily GitHub Agent.
@@ -96,17 +103,22 @@ def run_agent(
     """
     print_banner()
 
+    # Detect CI or non-interactive headless environment
+    is_ci = os.getenv("CI", "").strip().lower() in ("true", "1", "yes")
+    if is_ci:
+        use_gui = False
+
     logs_dir = base_dir / "logs"
     log_file = setup_logger(logs_dir, debug)
     logger.info("=== Daily GitHub Agent V1 Started ===")
 
-    # GUI Step 1: Confirmation Popup
+    # GUI Step 1: Confirmation Popup (only in local interactive mode)
     if use_gui:
         confirmed = confirmation_gui.show_confirmation()
         if not confirmed:
             print("\n[i] Execution cancelled by user.")
             logger.info("Execution cancelled by user at confirmation dialog.")
-            return 0
+            return EXIT_SUCCESS
 
     try:
         # 1. Load Settings
@@ -114,13 +126,29 @@ def run_agent(
         print(f"[*] Loading settings from: {settings_path.name}")
         settings = load_settings(settings_path)
 
-        dry_run = settings["dry_run"]
+        # Check Emergency Pause
+        if validator.check_emergency_pause(settings):
+            print("\n" + "=" * 60)
+            print(" [!] EMERGENCY PAUSE ACTIVE")
+            print(" Automation is paused via config or AUTOMATION_PAUSED environment variable.")
+            print(" Exiting cleanly without modifying any repositories.")
+            print("=" * 60 + "\n")
+            logger.warning("Emergency pause active: Execution halted cleanly without modifications.")
+            return EXIT_SUCCESS
+
+        if dry_run_override is not None:
+            dry_run = dry_run_override
+        else:
+            dry_run = settings["dry_run"]
+
         tasks_per_run = settings.get("tasks_per_run", 1)
         loop_tasks = settings.get("loop_tasks", False)
         workspace_name = settings["workspace_directory"]
         require_clean = settings["require_clean_git_before_start"]
         allowed_extensions = settings["allowed_extensions"]
         max_changed_files = settings["max_changed_files"]
+        allowed_repositories = settings.get("allowed_repositories")
+        allowed_branches = settings.get("allowed_branches")
 
         # Display Mode
         if dry_run:
@@ -168,7 +196,7 @@ def run_agent(
                 logger.info("All tasks in queue are completed.")
                 if use_gui:
                     confirmation_gui.show_success()
-                return 0
+                return EXIT_SUCCESS
 
         # Select batch for this run
         batch = pending_tasks[:tasks_per_run]
@@ -207,11 +235,20 @@ def run_agent(
                 if not is_git:
                     raise git_manager.GitError(f"Directory is not a valid Git repository: {git_msg}")
 
+                # Enforce Repository and Branch Allowlists
+                current_branch = git_manager.get_current_branch(project_dir)
+                validator.validate_repository_and_branch(
+                    project_name=task.project,
+                    branch_name=current_branch,
+                    allowed_repositories=allowed_repositories,
+                    allowed_branches=allowed_branches,
+                )
+
                 # Auto Sync with Remote Repository (git pull) if clean
                 is_clean, dirty_files = git_manager.is_git_clean(project_dir)
                 if is_clean and not dry_run:
                     print("[*] Syncing with remote repository (git pull)...")
-                    pull_ok, pull_msg = git_manager.git_pull(project_dir)
+                    pull_ok, pull_msg = git_manager.git_pull(project_dir, branch=current_branch)
                     if pull_ok:
                         print(" [OK] Git pull synced successfully.")
                     else:
@@ -281,11 +318,52 @@ def run_agent(
                     commit_created = True
                     logger.info(f"Task #{task.id} committed: {commit_hash}")
 
-                    print("[*] Pushing to remote repository...")
-                    push_out = git_manager.git_push(project_dir)
-                    push_status = f"Success: {push_out}"
-                    logger.info(f"Task #{task.id} push result: {push_status}")
+                    # Bounded push with conflict recovery
+                    max_push_retries = 3
+                    push_status = ""
+                    for push_attempt in range(1, max_push_retries + 1):
+                        try:
+                            print(f"[*] Pushing to remote repository (attempt {push_attempt}/{max_push_retries})...")
+                            push_out = git_manager.git_push(project_dir, branch=current_branch)
+                            push_status = f"Success: {push_out}"
+                            break
+                        except git_manager.GitError as push_err:
+                            logger.warning(f"Push attempt {push_attempt} failed: {push_err}")
+                            if git_manager.is_commit_on_remote(project_dir, commit_hash, branch=current_branch):
+                                push_status = f"Success (verified on remote): {commit_hash}"
+                                break
+                            if push_attempt < max_push_retries:
+                                print(f"[*] Push rejected or failed. Fetching latest remote branch '{current_branch}' to recover...")
+                                git_manager.undo_last_commit(project_dir)
+                                commit_created = False
+                                validator.restore_backup(target_file, backup_file)
 
+                                pull_ok, pull_msg = git_manager.git_pull(project_dir, branch=current_branch)
+                                if not pull_ok:
+                                    raise git_manager.GitError(f"Cannot recover from push rejection: remote pull failed: {pull_msg}")
+
+                                print(f"[*] Re-applying action '{task.action}' on updated branch...")
+                                result = task_manager.execute_task(task, target_file, allow_duplicate=loop_tasks)
+                                if result.already_completed:
+                                    print(f" [i] Task #{task.id} already completed after remote sync: {result.message}")
+                                    validator.cleanup_backup(backup_file)
+                                    task_manager.mark_task_completed(task_path, task.id, commit_hash="ALREADY_APPLIED")
+                                    push_status = "Already applied after sync"
+                                    break
+
+                                changed_files = git_manager.get_changed_files(project_dir)
+                                validator.validate_git_changes(
+                                    changed_files=changed_files,
+                                    expected_rel_file=task.file,
+                                    max_changed_files=max_changed_files,
+                                )
+                                git_manager.git_add(project_dir, task.file)
+                                commit_hash = git_manager.git_commit(project_dir, task.commit_message)
+                                commit_created = True
+                            else:
+                                raise push_err
+
+                    logger.info(f"Task #{task.id} push result: {push_status}")
                     validator.cleanup_backup(backup_file)
 
                     # Update status in task.json
@@ -294,9 +372,10 @@ def run_agent(
                     print(f" [OK] SUCCESS for Task #{task.id}: Commit {commit_hash} | Remote: {push_status}")
                     executed_count += 1
 
-            except (validator.ValidationError, task_manager.TaskError, git_manager.GitError) as e:
-                print(f"\n[ERROR on Task #{task.id}] {e}")
-                logger.error(f"Task #{task.id} failed: {e}")
+            except validator.ValidationError as e:
+                print(f"\n[VALIDATION ERROR on Task #{task.id}] {e}")
+                logger.error(f"Task #{task.id} validation failed: {e}")
+                notifier.notify_failure(str(e), task_id=str(task.id), project=task.project)
                 if commit_created and project_dir:
                     git_manager.undo_last_commit(project_dir)
                 if target_file and backup_file:
@@ -304,7 +383,33 @@ def run_agent(
                     validator.cleanup_backup(backup_file)
                 if use_gui:
                     confirmation_gui.show_failure()
-                return 1
+                return EXIT_ERROR
+
+            except git_manager.GitError as e:
+                print(f"\n[GIT ERROR on Task #{task.id}] {e}")
+                logger.error(f"Task #{task.id} git error: {e}")
+                notifier.notify_failure(str(e), task_id=str(task.id), project=task.project)
+                if commit_created and project_dir:
+                    git_manager.undo_last_commit(project_dir)
+                if target_file and backup_file:
+                    validator.restore_backup(target_file, backup_file)
+                    validator.cleanup_backup(backup_file)
+                if use_gui:
+                    confirmation_gui.show_failure()
+                return EXIT_ERROR
+
+            except task_manager.TaskError as e:
+                print(f"\n[TASK ERROR on Task #{task.id}] {e}")
+                logger.error(f"Task #{task.id} task error: {e}")
+                notifier.notify_failure(str(e), task_id=str(task.id), project=task.project)
+                if commit_created and project_dir:
+                    git_manager.undo_last_commit(project_dir)
+                if target_file and backup_file:
+                    validator.restore_backup(target_file, backup_file)
+                    validator.cleanup_backup(backup_file)
+                if use_gui:
+                    confirmation_gui.show_failure()
+                return EXIT_ERROR
 
         # Summary of the run
         remaining_count = len(pending_tasks) - executed_count
@@ -317,7 +422,7 @@ def run_agent(
             print("=" * 60 + "\n")
             if use_gui:
                 confirmation_gui.show_dry_run_result()
-            return 0
+            return EXIT_SUCCESS
         else:
             print(" [OK] BATCH EXECUTION FINISHED SUCCESSFULLY")
             print(f" - Completed and committed {executed_count} task(s)")
@@ -329,18 +434,36 @@ def run_agent(
             print("=" * 60 + "\n")
             if use_gui:
                 confirmation_gui.show_success()
-            return 0
+            return EXIT_SUCCESS
 
-    except (validator.ValidationError, task_manager.TaskError, git_manager.GitError) as e:
-        print(f"\n[ERROR] {e}")
-        logger.error(f"Execution failed: {e}")
+    except validator.ValidationError as e:
+        print(f"\n[VALIDATION ERROR] {e}")
+        logger.error(f"Validation failed: {e}")
+        notifier.notify_failure(str(e))
         if use_gui:
             confirmation_gui.show_failure()
-        return 1
+        return EXIT_ERROR
+
+    except git_manager.GitError as e:
+        print(f"\n[GIT ERROR] {e}")
+        logger.error(f"Git failed: {e}")
+        notifier.notify_failure(str(e))
+        if use_gui:
+            confirmation_gui.show_failure()
+        return EXIT_ERROR
+
+    except task_manager.TaskError as e:
+        print(f"\n[TASK ERROR] {e}")
+        logger.error(f"Task failed: {e}")
+        notifier.notify_failure(str(e))
+        if use_gui:
+            confirmation_gui.show_failure()
+        return EXIT_ERROR
 
     except Exception as e:
         print(f"\n[UNEXPECTED ERROR] An error occurred: {e}")
         logger.error(f"Unexpected exception: {e}")
+        notifier.notify_failure(str(e))
         if debug:
             import traceback
             traceback.print_exc()
@@ -348,7 +471,7 @@ def run_agent(
             print("Run with --debug for detailed traceback.")
         if use_gui:
             confirmation_gui.show_failure()
-        return 1
+        return EXIT_ERROR
 
 
 def main() -> None:
@@ -369,17 +492,38 @@ def main() -> None:
         action="store_true",
         help="Run in CLI headless mode without GUI confirmation or result popups",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Alias for --no-gui; run in unattended headless mode",
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Force dry-run mode (no commit or push will occur)",
+    )
+    mode_group.add_argument(
+        "--live",
+        action="store_true",
+        help="Force live mode (commit and push enabled)",
+    )
 
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
     config_directory = (args.config_dir or (script_dir / "config")).resolve()
 
+    dry_run_override = True if args.dry_run else (False if args.live else None)
+    use_gui = not (args.no_gui or args.headless)
+
     exit_code = run_agent(
         base_dir=script_dir,
         config_dir=config_directory,
         debug=args.debug,
-        use_gui=not args.no_gui,
+        use_gui=use_gui,
+        dry_run_override=dry_run_override,
     )
     sys.exit(exit_code)
 

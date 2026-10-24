@@ -11,11 +11,35 @@ Strictly adheres to safety rules:
 from __future__ import annotations
 
 import logging
+import os
+import re
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger("daily_github_agent")
+
+DEFAULT_GIT_TIMEOUT: int = 120
+
+# Regex patterns for redacting sensitive credentials and tokens in logs
+_REDACTION_PATTERNS = [
+    (re.compile(r"https?://(?:[^:@/]+(?::[^@/]*)?@)"), "https://[REDACTED_CREDENTIAL]@"),
+    (re.compile(r"ghp_[A-Za-z0-9]{36}"), "[REDACTED_GH_TOKEN]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{82}"), "[REDACTED_GH_PAT]"),
+    (re.compile(r"ghs_[A-Za-z0-9]{36}"), "[REDACTED_GH_APP_TOKEN]"),
+]
+
+
+def redact_sensitive_text(text: str) -> str:
+    """
+    Mask any personal access tokens, app tokens, or basic auth credentials from text.
+    """
+    if not text:
+        return text
+    redacted = text
+    for pattern, replacement in _REDACTION_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
 
 
 class GitError(Exception):
@@ -27,13 +51,19 @@ def _run_git_command(
     args: List[str],
     cwd: Optional[Path] = None,
     check: bool = True,
+    timeout: int = DEFAULT_GIT_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
     """
-    Execute a Git command safely using subprocess list arguments (shell=False).
+    Execute a Git command safely using subprocess list arguments (shell=False) with bounded timeout.
     """
     full_cmd = ["git"] + args
     cwd_str = str(cwd) if cwd else None
-    logger.debug(f"Executing Git command: {' '.join(full_cmd)} (cwd={cwd_str})")
+    sanitized_cmd = redact_sensitive_text(" ".join(full_cmd))
+    logger.debug(f"Executing Git command: {sanitized_cmd} (cwd={cwd_str})")
+
+    # Enforce non-interactive credential prompts to fail closed rather than hanging in CI
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
 
     try:
         result = subprocess.run(
@@ -43,17 +73,22 @@ def _run_git_command(
             text=True,
             shell=False,
             check=False,
+            timeout=timeout,
+            env=env,
             encoding="utf-8",
             errors="replace",
         )
     except FileNotFoundError:
         raise GitError("Git executable was not found on your system. Please install Git and add it to PATH.")
+    except subprocess.TimeoutExpired:
+        raise GitError(f"Git command timed out after {timeout} seconds: {sanitized_cmd}")
     except Exception as e:
-        raise GitError(f"Unexpected error executing Git command: {e}")
+        raise GitError(f"Unexpected error executing Git command: {redact_sensitive_text(str(e))}")
 
     if check and result.returncode != 0:
-        err_msg = result.stderr.strip() or result.stdout.strip()
-        raise GitError(f"Git command '{' '.join(full_cmd)}' failed (exit code {result.returncode}): {err_msg}")
+        raw_err = result.stderr.strip() or result.stdout.strip()
+        err_msg = redact_sensitive_text(raw_err)
+        raise GitError(f"Git command '{sanitized_cmd}' failed (exit code {result.returncode}): {err_msg}")
 
     return result
 
@@ -153,12 +188,13 @@ def git_add(repo_path: Path, file_rel_path: str) -> None:
 def git_commit(repo_path: Path, commit_message: str) -> str:
     """
     Commit staged changes with the provided commit message and return the new commit hash.
+    Uses --message= flag to prevent option injection if message starts with '-'.
     """
     if not commit_message.strip():
         raise GitError("Commit message cannot be empty.")
 
     logger.info(f"Committing with message: '{commit_message}'")
-    _run_git_command(["commit", "-m", commit_message], cwd=repo_path, check=True)
+    _run_git_command(["commit", f"--message={commit_message}"], cwd=repo_path, check=True)
 
     # Get latest commit hash
     hash_proc = _run_git_command(["rev-parse", "--short", "HEAD"], cwd=repo_path, check=True)
@@ -183,8 +219,8 @@ def git_push(repo_path: Path, remote: str = "origin", branch: Optional[str] = No
     logger.info(f"Pushing to remote '{remote}' branch '{target_branch}'...")
 
     proc = _run_git_command(["push", remote, target_branch], cwd=repo_path, check=True)
-    out = proc.stdout.strip() or proc.stderr.strip() or f"Pushed successfully to {remote}/{target_branch}"
-    return out
+    raw_out = proc.stdout.strip() or proc.stderr.strip() or f"Pushed successfully to {remote}/{target_branch}"
+    return redact_sensitive_text(raw_out)
 
 
 def git_pull(repo_path: Path, remote: str = "origin", branch: Optional[str] = None) -> Tuple[bool, str]:
@@ -197,11 +233,51 @@ def git_pull(repo_path: Path, remote: str = "origin", branch: Optional[str] = No
     proc = _run_git_command(["pull", remote, target_branch], cwd=repo_path, check=False)
     if proc.returncode == 0:
         out = proc.stdout.strip() or f"Pulled successfully from {remote}/{target_branch}"
-        return True, out
+        return True, redact_sensitive_text(out)
     else:
         err = proc.stderr.strip() or proc.stdout.strip() or "git pull failed"
-        logger.warning(f"Git pull warning: {err}")
-        return False, err
+        sanitized_err = redact_sensitive_text(err)
+        logger.warning(f"Git pull warning: {sanitized_err}")
+        return False, sanitized_err
+
+
+def git_fetch(repo_path: Path, remote: str = "origin", branch: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Fetch latest commits from remote without merging.
+    """
+    target_branch = branch or get_current_branch(repo_path)
+    logger.info(f"Fetching from remote '{remote}' branch '{target_branch}'...")
+
+    proc = _run_git_command(["fetch", remote, target_branch], cwd=repo_path, check=False)
+    if proc.returncode == 0:
+        out = proc.stdout.strip() or "Fetch successful"
+        return True, redact_sensitive_text(out)
+    else:
+        err = proc.stderr.strip() or proc.stdout.strip() or "git fetch failed"
+        return False, redact_sensitive_text(err)
+
+
+def is_commit_on_remote(
+    repo_path: Path,
+    commit_hash: str,
+    remote: str = "origin",
+    branch: Optional[str] = None,
+) -> bool:
+    """
+    Check if a specific commit hash has been published to the remote branch.
+    """
+    target_branch = branch or get_current_branch(repo_path)
+    proc = _run_git_command(
+        ["branch", "-r", "--contains", commit_hash],
+        cwd=repo_path,
+        check=False,
+    )
+    if proc.returncode == 0:
+        expected = f"{remote}/{target_branch}"
+        for line in proc.stdout.splitlines():
+            if expected in line.strip():
+                return True
+    return False
 
 
 def undo_last_commit(repo_path: Path) -> None:
@@ -210,4 +286,5 @@ def undo_last_commit(repo_path: Path) -> None:
     """
     logger.info("Undoing last local commit to maintain clean repository state...")
     _run_git_command(["reset", "HEAD~1"], cwd=repo_path, check=False)
+
 

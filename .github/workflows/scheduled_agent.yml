@@ -1,0 +1,123 @@
+name: Autonomous Cloud Agent
+
+on:
+  schedule:
+    # Runs daily at 03:17 UTC (08:47 AM IST) - chosen off-peak minute to avoid GitHub cron congestion
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution Mode'
+        required: true
+        default: 'dry-run'
+        type: choice
+        options:
+          - 'dry-run'
+          - 'live'
+
+# Enforce single concurrent execution to prevent race conditions or duplicate runs
+concurrency:
+  group: auto-git-pusher-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  run-autonomous-agent:
+    name: Execute Auto Git Pusher
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 1. Checkout Controller Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 2. Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 3. Verify Baseline Test Suite (Fail Closed)
+        run: |
+          echo "Running pre-flight automated test suite..."
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: 4. Configure Git User Identity
+        run: |
+          git config --global user.name "Auto Git Pusher [Bot]"
+          git config --global user.email "auto-git-pusher[bot]@users.noreply.github.com"
+          git config --global init.defaultBranch main
+
+      - name: 5. Prepare Target Workspace
+        env:
+          AUTO_GIT_TOKEN: ${{ secrets.AUTO_GIT_TOKEN }}
+        run: |
+          mkdir -p workspace
+          cd workspace
+
+          # Target repository is Kishore-2007-web/weather
+          # If AUTO_GIT_TOKEN secret is configured, use authenticated HTTPS URL; else fallback to public clone
+          if [ -n "$AUTO_GIT_TOKEN" ]; then
+            echo "Cloning target repository using scoped token credentials..."
+            git clone "https://x-access-token:${AUTO_GIT_TOKEN}@github.com/Kishore-2007-web/weather.git" weather
+          else
+            echo "AUTO_GIT_TOKEN not found in secrets. Cloning via public HTTPS URL..."
+            git clone "https://github.com/Kishore-2007-web/weather.git" weather
+          fi
+
+          cd weather
+          git branch -a
+          echo "Target repository clone verified."
+
+      - name: 6. Execute Autonomous Agent
+        id: execute_agent
+        env:
+          CI: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTO_GIT_TOKEN: ${{ secrets.AUTO_GIT_TOKEN }}
+        run: |
+          # Determine execution mode: workflow_dispatch input takes priority, else default to settings.json
+          CLI_ARGS="--headless --debug"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.mode }}" = "live" ]; then
+              CLI_ARGS="$CLI_ARGS --live"
+            else
+              CLI_ARGS="$CLI_ARGS --dry-run"
+            fi
+          fi
+
+          echo "Running agent with arguments: $CLI_ARGS"
+          python agent.py $CLI_ARGS
+
+      - name: 7. Commit Updated Task Queue State (Controller Repo)
+        if: success() && ((github.event_name == 'schedule') || (inputs.mode == 'live'))
+        run: |
+          echo "Checking if config/task.json was updated..."
+          if [ -n "$(git status --porcelain config/task.json)" ]; then
+            echo "Committing updated task state back to controller repository..."
+            git add config/task.json
+            git commit --message="chore(agent): record completed task state [skip ci]"
+            git push origin main
+            echo "Task state updated successfully."
+          else
+            echo "No task queue state changes to commit."
+          fi
+
+      - name: 8. Dispatch Failure Alert
+        if: failure()
+        env:
+          CI: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Automation step failed. Invoking failure notification dispatcher..."
+          python -c "
+          import notifier
+          notifier.notify_failure(
+              error_summary='Scheduled execution failed in cloud runner. See Actions logs for full diagnostic trace.',
+              details='Job step failed during validation, task execution, or remote publishing.'
+          )
+          "
