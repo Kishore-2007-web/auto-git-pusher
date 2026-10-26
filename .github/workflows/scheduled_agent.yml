@@ -41,16 +41,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 3. Verify Baseline Test Suite (Fail Closed)
-        run: |
-          echo "Running pre-flight automated test suite..."
-          python -m unittest discover -s tests -p "test_*.py" -v
-
-      - name: 4. Configure Git User Identity
+      - name: 3. Configure Git User Identity
         run: |
           git config --global user.name "Auto Git Pusher [Bot]"
           git config --global user.email "auto-git-pusher[bot]@users.noreply.github.com"
           git config --global init.defaultBranch main
+
+      - name: 4. Verify Baseline Test Suite (Fail Closed)
+        run: |
+          echo "Running pre-flight automated test suite..."
+          python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: 5. Prepare Target Workspace
         env:

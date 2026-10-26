@@ -94,7 +94,7 @@ def run_agent(
     base_dir: Path,
     config_dir: Path,
     debug: bool = False,
-    use_gui: bool = False,
+    use_gui: Optional[bool] = None,
     dry_run_override: Optional[bool] = None,
 ) -> int:
     """
@@ -103,10 +103,10 @@ def run_agent(
     """
     print_banner()
 
-    # Detect CI or non-interactive headless environment
-    is_ci = os.getenv("CI", "").strip().lower() in ("true", "1", "yes")
-    if is_ci:
-        use_gui = False
+    # Detect CI or non-interactive headless environment if not explicitly specified
+    if use_gui is None:
+        is_ci = os.getenv("CI", "").strip().lower() in ("true", "1", "yes")
+        use_gui = not is_ci
 
     logs_dir = base_dir / "logs"
     log_file = setup_logger(logs_dir, debug)
@@ -516,7 +516,8 @@ def main() -> None:
     config_directory = (args.config_dir or (script_dir / "config")).resolve()
 
     dry_run_override = True if args.dry_run else (False if args.live else None)
-    use_gui = not (args.no_gui or args.headless)
+    is_ci = os.getenv("CI", "").strip().lower() in ("true", "1", "yes")
+    use_gui = not (args.no_gui or args.headless or is_ci)
 
     exit_code = run_agent(
         base_dir=script_dir,

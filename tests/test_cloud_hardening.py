@@ -164,12 +164,12 @@ class TestCloudHardeningAndSecurity(unittest.TestCase):
 
     @patch("confirmation_gui.show_confirmation")
     def test_headless_ci_auto_detection(self, mock_show_confirm: MagicMock) -> None:
-        # In CI environment, use_gui=True should be automatically ignored
+        # In CI environment, default use_gui (None) should automatically evaluate to False
         with patch.dict(os.environ, {"CI": "true"}):
             exit_code = agent.run_agent(
                 base_dir=self.temp_dir,
                 config_dir=self.config_dir,
-                use_gui=True,
+                use_gui=None,
             )
             # GUI popup should NEVER have been called
             mock_show_confirm.assert_not_called()

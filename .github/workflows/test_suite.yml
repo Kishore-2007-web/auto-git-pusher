@@ -23,6 +23,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Configure Git User Identity
+        run: |
+          git config --global user.name "Test Runner [Bot]"
+          git config --global user.email "test-runner[bot]@users.noreply.github.com"
+          git config --global init.defaultBranch main
+
       - name: Run Unit and Integration Tests
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
